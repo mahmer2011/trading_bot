@@ -1,0 +1,12 @@
+# requirements.txt
+MetaTrader5         # ← official MT5-Python API
+numpy
+pandas
+scipy               # for certain TA-lib dependencies
+ta-lib              # for RSI, EMA, ATR, etc. [See note below]
+ta                  # alternative if TA-lib installation issues arise
+tensorflow          # or torch, depending on your choice of framework
+scikit-learn        # for train/test split, metrics
+matplotlib          # plotting (for backtest/report generation)
+#python‐telegram-bot # optional, for Telegram alerts
+PyYAML              # if using YAML config instead of JSON
