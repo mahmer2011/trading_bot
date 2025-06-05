@@ -1,50 +1,37 @@
-import tensorflow as tf
+# model_lstm.py
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
 
-def build_lstm_model(input_shape, dropout_rate: float = 0.2) -> tf.keras.Model:
+def build_3class_lstm_model(input_shape):
     """
-    input_shape = (lookback, num_features)
+    Build and compile a 3-class LSTM model.
+    input_shape should be a tuple: (lookback, num_features).
     """
     model = Sequential()
-    model.add(LSTM(units=64, return_sequences=True, input_shape=input_shape))
-    model.add(BatchNormalization())
-    model.add(Dropout(dropout_rate))
+    model.add(Input(shape=input_shape))
 
-    model.add(LSTM(units=32))
+    # First LSTM block
+    model.add(LSTM(128, return_sequences=True))
     model.add(BatchNormalization())
-    model.add(Dropout(dropout_rate))
+    model.add(Dropout(0.3))
 
-    model.add(Dense(units=16, activation="relu"))
-    model.add(Dense(units=1, activation="sigmoid"))  # binary classification
+    # Second LSTM block
+    model.add(LSTM(64))
+    model.add(BatchNormalization())
+    model.add(Dropout(0.3))
+
+    # Dense layers
+    model.add(Dense(32, activation="relu"))
+    model.add(BatchNormalization())
+    model.add(Dropout(0.2))
+
+    # Final 3-class output
+    model.add(Dense(3, activation="softmax"))
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss="binary_crossentropy",
+        optimizer=Adam(learning_rate=5e-5),
+        loss="sparse_categorical_crossentropy",
         metrics=["accuracy"]
     )
     return model
-
-
-import os
-
-def train_model(
-    X_train, y_train, X_val, y_val,
-    input_shape, model_save_path="models/lstm_model.h5",
-    epochs=50, batch_size=64
-):
-    model = build_lstm_model(input_shape)
-    callbacks = [
-        EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True),
-        ModelCheckpoint(model_save_path, monitor="val_accuracy", save_best_only=True)
-    ]
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks,
-        verbose=1
-    )
-    return model, history

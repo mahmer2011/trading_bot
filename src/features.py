@@ -1,12 +1,16 @@
 # src/features.py
 import pandas as pd
 import talib
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
 
-def add_RSI_EMA(df: pd.DataFrame, rsi_period: int = 14, ema_periods: list = [20, 50]):
+# -------------------------
+# 1. Basic Indicator Functions
+# -------------------------
+
+def add_RSI_EMA(df: pd.DataFrame, rsi_period: int = 14, ema_periods: list = [20, 50]) -> pd.DataFrame:
     """
-    Given a DataFrame with columns [time, Open, High, Low, Close, Volume],
-    compute RSI and a list of EMAs. Return DataFrame with new columns:
-       'RSI', 'EMA_{period}' for each period in ema_periods.
+    Compute RSI and multiple EMAs using TA-Lib.
     """
     close = df["Close"].values
     df["RSI"] = talib.RSI(close, timeperiod=rsi_period)
@@ -14,95 +18,203 @@ def add_RSI_EMA(df: pd.DataFrame, rsi_period: int = 14, ema_periods: list = [20,
         df[f"EMA_{p}"] = talib.EMA(close, timeperiod=p)
     return df
 
-def add_ATR(df: pd.DataFrame, atr_period: int = 14):
-    df["ATR"] = talib.ATR(df["High"], df["Low"], df["Close"], timeperiod=atr_period)
+
+def add_ATR(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
+    """
+    Compute ATR using TA-Lib.
+    """
+    high = df["High"].values
+    low = df["Low"].values
+    close = df["Close"].values
+    df["ATR"] = talib.ATR(high, low, close, timeperiod=atr_period)
     return df
 
-def add_candlestick_patterns(df: pd.DataFrame):
-    o, h, l, c = df["Open"].values, df["High"].values, df["Low"].values, df["Close"].values
-    # Example: Hammer, Engulfing, Doji
+
+def add_candlestick_patterns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute selected candlestick pattern signals using TA-Lib.
+    Each output is an integer: >0 bullish, <0 bearish, 0 none.
+    """
+    o = df["Open"].values
+    h = df["High"].values
+    l = df["Low"].values
+    c = df["Close"].values
+
     df["HAMMER"] = talib.CDLHAMMER(o, h, l, c)
     df["ENGULFING"] = talib.CDLENGULFING(o, h, l, c)
     df["DOJI"] = talib.CDLDOJI(o, h, l, c)
-    # ... add more as needed
+    # Add more patterns if desired
     return df
 
-def add_VSA_signals(df: pd.DataFrame):
+# -------------------------
+# 2. Refined Volume Spread Analysis (VSA)
+# -------------------------
+
+def classify_vsa(row: pd.Series) -> str:
     """
-    Add simplistic VSA signals:
-      - 'Climactic Spread': when volume is > 2x average volume, and spread (High−Low) is large.
-      - 'No Demand': when volume is below moving average of volume.
-      - 'No Supply': similar concept, but you decide thresholds.
-    For serious VSA, consult detailed sources. Below is a toy illustration.
+    Classify a single bar into VSA categories:
+      - 'No Demand': narrow spread up bar on low volume
+      - 'No Supply': narrow spread down bar on low volume
+      - 'Buying Climax': wide spread up bar on very high volume closing off high
+      - 'Selling Climax': wide spread down bar on very high volume closing off low
+      - 'Stopping Volume': high-volume down bar that closes near its high
+      - 'Normal': none of the above
     """
-    # Calculate average volume over last N bars (e.g., 20)
-    df["Vol_MA20"] = df["Volume"].rolling(window=20, min_periods=1).mean()
-    # Spread: high-low
-    df["Spread"] = df["High"] - df["Low"]
+    spread = row['spread']
+    open_ = row['Open']
+    high = row['High']
+    low = row['Low']
+    close = row['Close']
+    volume = row['Volume']
+    volume_avg = row['volume_avg']
+    spread_avg = row['spread_avg']
 
-    # Climactic Spread: huge volume & large spread
-    df["Climactic_Spread"] = ((df["Volume"] > 2 * df["Vol_MA20"]) & (df["Spread"] > df["Spread"].rolling(20).mean())).astype(int)
+    is_up_bar = close > open_
+    is_down_bar = close < open_
 
-    # No Demand: low volume, small spread, closes near low
-    df["No_Demand"] = ((df["Volume"] < 0.5 * df["Vol_MA20"]) & (df["Close"] < df["High"] * 0.995)).astype(int)
+    # No Demand / No Supply: narrow spread & low volume
+    if spread < 0.8 * spread_avg and volume < 0.8 * volume_avg:
+        if is_up_bar:
+            return 'No Demand'
+        elif is_down_bar:
+            return 'No Supply'
 
-    # No Supply: low volume, small spread, closes near high
-    df["No_Supply"] = ((df["Volume"] < 0.5 * df["Vol_MA20"]) & (df["Close"] > df["Low"] * 1.005)).astype(int)
+    # Buying Climax / Selling Climax: wide spread & very high volume
+    if spread > 1.5 * spread_avg and volume > 1.5 * volume_avg:
+        # bullish candle but close is off high by some margin
+        if is_up_bar and (close < high * 0.995):
+            return 'Buying Climax'
+        # bearish candle but close is off low by some margin
+        if is_down_bar and (close > low * 1.005):
+            return 'Selling Climax'
 
-    # Clean up
-    df.drop(columns=["Vol_MA20", "Spread"], inplace=True)
+    # Stopping Volume: high-volume down bar closing near high
+    if is_down_bar and volume > 1.3 * volume_avg and (close > open_ * 1.0):
+        return 'Stopping Volume'
+
+    return 'Normal'
+
+
+def add_VSA_signals_refined(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add refined VSA signals to DataFrame. Columns added:
+      - spread, volume_avg, spread_avg
+      - vsa_signal (categorical string)
+      - One-hot columns for each VSA type
+    """
+    df = df.copy()
+    # 1. Compute spread and rolling averages
+    df['spread'] = df['High'] - df['Low']
+    df['volume_avg'] = df['Volume'].rolling(window=20, min_periods=1).mean()
+    df['spread_avg'] = df['spread'].rolling(window=20, min_periods=1).mean()
+
+    # 2. Classify each bar
+    df['vsa_signal'] = df.apply(classify_vsa, axis=1)
+
+    # 3. One-hot encode categories
+    vsa_types = ['No Demand', 'No Supply', 'Buying Climax', 'Selling Climax', 'Stopping Volume']
+    for vt in vsa_types:
+        df[f"VSA_{vt.replace(' ', '_')}"] = (df['vsa_signal'] == vt).astype(int)
+
+    # 4. Drop intermediate columns if not needed
+    df.drop(columns=['spread', 'volume_avg', 'spread_avg'], inplace=True)
     return df
 
+# -------------------------
+# 3. Refined Order Block Detection
+# -------------------------
 
-def add_order_blocks(df: pd.DataFrame):
+def is_strong_bearish_move(df: pd.DataFrame, i: int, body_factor: float = 1.5) -> bool:
     """
-    Very naive: mark any candle that precedes a 3-bar consecutive close-up move,
-    and whose close is the lowest of the prior 5 bars, as a bullish order block.
-    Mirror for bearish. This is illustrative only.
+    Detect if the candle at index i is a strong bearish move:
+      - Body size > body_factor * avg spread
+      - Next candle is also bearish and strong
     """
+    spread_avg = df['High'].rolling(window=20, min_periods=1).mean()
+    avg_spread = spread_avg.iloc[i] if i < len(spread_avg) else spread_avg.iloc[-1]
+
+    open_i = df.at[i, 'Open']
+    close_i = df.at[i, 'Close']
+    body_i = open_i - close_i  # positive if bearish
+
+    open_next = df.at[i+1, 'Open']
+    close_next = df.at[i+1, 'Close']
+    body_next = open_next - close_next  # positive if bearish
+
+    return (body_i > body_factor * avg_spread) and (body_next > body_factor * avg_spread)
+
+
+def is_strong_bullish_move(df: pd.DataFrame, i: int, body_factor: float = 1.5) -> bool:
+    """
+    Detect if the candle at index i is a strong bullish move:
+      - Body size > body_factor * avg spread
+      - Next candle is also bullish and strong
+    """
+    spread_avg = df['High'].rolling(window=20, min_periods=1).mean()
+    avg_spread = spread_avg.iloc[i] if i < len(spread_avg) else spread_avg.iloc[-1]
+
+    open_i = df.at[i, 'Open']
+    close_i = df.at[i, 'Close']
+    body_i = close_i - open_i  # positive if bullish
+
+    open_next = df.at[i+1, 'Open']
+    close_next = df.at[i+1, 'Close']
+    body_next = close_next - open_next  # positive if bullish
+
+    return (body_i > body_factor * avg_spread) and (body_next > body_factor * avg_spread)
+
+
+def detect_order_blocks(df: pd.DataFrame, body_factor: float = 1.5) -> pd.DataFrame:
+    """
+    Identify bullish and bearish order blocks:
+      - Record the high (for bearish OB) or low (for bullish OB) of the candle at i
+      - Only if bar i and i+1 form a strong directional move
+      - Returns DataFrame with columns:
+          OB_type: 'bullish' or 'bearish' (NaN if none)
+          OB_price: price level of order block (NaN if none)
+    """
+    df = df.copy().reset_index(drop=True)
     n = len(df)
-    df["Bullish_OB"] = 0
-    df["Bearish_OB"] = 0
-    for i in range(5, n - 3):
-        window5 = df.iloc[i-5:i]["Close"]
-        # If the current close is the lowest of the past 5
-        if df.at[i, "Close"] == window5.min():
-            # Check next 3 bars are bullish (close > open)
-            if all(df.at[j, "Close"] > df.at[j, "Open"] for j in range(i+1, i+4)):
-                df.at[i, "Bullish_OB"] = 1
-        # Similarly for bearish
-        window5_high = df.iloc[i-5:i]["Close"]
-        if df.at[i, "Close"] == window5_high.max():
-            if all(df.at[j, "Close"] < df.at[j, "Open"] for j in range(i+1, i+4)):
-                df.at[i, "Bearish_OB"] = 1
+    df['OB_type'] = np.nan
+    df['OB_price'] = np.nan
+
+    for i in range(n - 1):
+        # Make sure we have enough future data
+        if i + 1 >= n:
+            break
+        if is_strong_bearish_move(df, i, body_factor):
+            # Bearish OB: high of candle i
+            df.at[i, 'OB_type'] = 'bearish'
+            df.at[i, 'OB_price'] = df.at[i, 'High']
+        elif is_strong_bullish_move(df, i, body_factor):
+            # Bullish OB: low of candle i
+            df.at[i, 'OB_type'] = 'bullish'
+            df.at[i, 'OB_price'] = df.at[i, 'Low']
     return df
 
+# -------------------------
+# 4. Sequence Creation for LSTM
+# -------------------------
 
-from sklearn.preprocessing import MinMaxScaler
-import numpy as np
-
-def create_sequences(df: pd.DataFrame, feature_cols: list, label_col: str,
-                     lookback: int = 60) -> (np.ndarray, np.ndarray, MinMaxScaler):
+def create_sequences(df: pd.DataFrame, feature_cols: list, label_col: str, lookback: int = 60):
     """
-    - feature_cols: list of column names to use as features (e.g., ["Close", "RSI", "EMA_20", ...]).
-    - label_col: column name for target (e.g., "Direction" = 1 if next bar up else 0).
-    - lookback: number of past bars to include in each sequence.
-    Returns: (X, y, scaler), where
-      X.shape = (num_samples, lookback, len(feature_cols)),
-      y.shape = (num_samples,).
+    Build normalized sequences for LSTM input.
+    - feature_cols: list of feature column names
+    - label_col: name of target column (binary or categorical integer)
+    - lookback: number of past bars per sequence
+    Returns: X (num_samples, lookback, num_features), y (num_samples,), scaler (fitted MinMaxScaler)
     """
-    # 1. Extract feature matrix and label vector
+    # Extract feature matrix and labels
     data = df[feature_cols].values.astype(float)
     labels = df[label_col].values.astype(int)
 
-    # 2. Scale features to [0,1]
     scaler = MinMaxScaler(feature_range=(0, 1))
     data_scaled = scaler.fit_transform(data)
 
     X, y = [], []
     for i in range(lookback, len(data_scaled) - 1):
         X.append(data_scaled[i - lookback:i, :])
-        y.append(labels[i + 1])  # next bar’s label
-    X, y = np.array(X), np.array(y)
+        y.append(labels[i + 1])
+    X = np.array(X)
+    y = np.array(y)
     return X, y, scaler
-
