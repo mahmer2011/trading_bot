@@ -30,7 +30,7 @@ def build_3class_lstm_model(input_shape):
     model.add(Dense(3, activation="softmax"))
 
     model.compile(
-        optimizer=Adam(learning_rate=5e-5),
+        optimizer=Adam(learning_rate=5e-4),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"]
     )
